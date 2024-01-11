@@ -123,7 +123,7 @@ def Mylogit11(hidden_states_new,node_indx,attention_mask=None):
 
     return key_states,attention_mask
 
-class MyCCAttention(nn.Module):
+class MyMyCCAttention(nn.Module):
     def __init__(self, config,num_attention_heads):
         super().__init__()
         self.config = config
@@ -170,12 +170,13 @@ class MyCCAttention(nn.Module):
         :param output_attentions: 
         :return:
         '''
+        # 也许这里不是我想象的掩码，而是节点下标，也就是我们要推测的难以预测的关系三元组
         node_indx = (attention_mask >0)  
-        
+        print("attention_mask.shape:",attention_mask.shape)
         # new_hidden_states, new_hidden_states_Q ：(?, hidden_size)
         new_hidden_states = Input[node_indx]
         new_hidden_states_Q = hidden_states[node_indx]
-
+        print("new_hidden_states.shape",new_hidden_states.shape,"............","new_hidden_states_Q.shape:",new_hidden_states_Q.shape)
         # q, k, v : (?, num_attention_heads, hidden_size//num_attention_heads)
         key_layer = self.transpose_for_scores(self.key(new_hidden_states))  
         value_layer = self.transpose_for_scores(self.value(new_hidden_states))  
@@ -183,7 +184,7 @@ class MyCCAttention(nn.Module):
 
         # new_hidden_states : (b,e_n,e_n,hidden_size//num_attention_heads)
         new_hidden_states = torch.zeros(hidden_states.size()[:-1]+(key_layer.size(-1),)).to(key_layer)
-        
+        print("new_hidden_states.shape",new_hidden_states.shape)
         key_layers, value_layers, attention_masks = [], [], []
         for i in range(self.num_attention_heads):
             j=i%4
@@ -192,16 +193,18 @@ class MyCCAttention(nn.Module):
             
             # (?,n*2,d), (b,1,n,n,n*2)
             key_state, attention_mask1 = self.logit_function[j](new_hidden_states, node_indx, attention_mask)
+            # (?, 33, 128)
             key_state = torch.cat((key_layer[:, i].unsqueeze(1),key_state),dim=1) 
 
             new_hidden_states[node_indx] = value_layer[:, i]    
             value_state, _ = self.logit_function[j](new_hidden_states, node_indx)
+            # (?, 33, 128)
             value_state = torch.cat((value_layer[:, i].unsqueeze(1), value_state), dim=1)  
 
             L = attention_mask1.size(0)
             attention_mask2 = torch.ones((L,1,1)).to(attention_mask1) 
+            # (?, 1, 33)
             attention_mask1 = torch.cat((attention_mask2, attention_mask1), dim=-1)  
-
             key_layers.append(key_state)
             value_layers.append(value_state)
             attention_masks.append(attention_mask1)
@@ -210,7 +213,7 @@ class MyCCAttention(nn.Module):
         key_layer = torch.stack(key_layers, dim=1)  
         value_layer = torch.stack(value_layers, dim=1)  
         attention_mask = torch.cat(attention_masks, dim=1)  
-
+        
         # (?, num_attention_heads, 1, hidden_size//num_attention_heads)
         query_layer = query_layer.unsqueeze(2) 
         # (?, num_attention_heads, 1, n+1) = (?, num_attention_heads, 1, hidden_size//num_attention_heads) @ (?, num_attention_heads, hidden_size//num_attention_heads, n+1)
@@ -221,9 +224,11 @@ class MyCCAttention(nn.Module):
             attention_scores = attention_scores + attention_mask.unsqueeze(2)
 
         attention_probs = nn.Softmax(dim=-1)(attention_scores)
+        # (?,4,1,33)
         attention_probs = self.dropout(attention_probs)
 
         # (?, num_attention_heads, 1, n+1) * (?, num_attention_heads, n+1, hidden_size//num_attention_heads)
+        # (?,4,128)
         context_layer = torch.matmul(attention_probs, value_layer).squeeze(-2)
         new_context_layer_shape = context_layer.size()[:-2] + (context_layer.size(-1)*context_layer.size(-2),)
         context_layer = context_layer.view(*new_context_layer_shape)
