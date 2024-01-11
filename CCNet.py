@@ -323,10 +323,10 @@ def logit44(hidden_states_new,node_indx,attention_mask=None):
 
 def logit111(hidden_states_new,node_indx,attention_mask=None):
     b, n, _, d = hidden_states_new.size()
+    # (b,n,n,n,d)
     col_states1 = hidden_states_new.unsqueeze(2).expand(b, n, n, n, d)  
-    
+    # (?,n,d)
     key_states = col_states1[node_indx]
-
     if attention_mask is not None:
         col_mask1 = attention_mask.unsqueeze(2).expand(b, n, n, n)  
         
@@ -336,17 +336,19 @@ def logit111(hidden_states_new,node_indx,attention_mask=None):
         attention_mask = col_mask1[node_indx]
 
         attention_mask = (1.0 - attention_mask) * -10000.0  
+        # (?,1,n)
         attention_mask = attention_mask.unsqueeze(1)  
-
+        
     return key_states,attention_mask
 
 def logit222(hidden_states_new,node_indx,attention_mask=None):
     b, n, _, d = hidden_states_new.size()
     row_states = hidden_states_new.permute(0, 2, 1, 3).contiguous()
+    # (b,n,n,n,d)
     row_states1 = row_states.unsqueeze(1).expand(b, n, n, n, d)     
     
+     # (?,n,d)
     key_states = row_states1[node_indx]
-
     if attention_mask is not None:
         col_mask1 = attention_mask.unsqueeze(2).expand(b, n, n, n)  
         row_mask = attention_mask.permute(0, 2, 1).contiguous()
@@ -361,8 +363,9 @@ def logit222(hidden_states_new,node_indx,attention_mask=None):
         attention_mask = row_mask1[node_indx]
 
         attention_mask = (1.0 - attention_mask) * -10000.0  
+        # (?,1,n)
         attention_mask = attention_mask.unsqueeze(1)  
-
+        
     return key_states,attention_mask
 
 def logit333(hidden_states_new,node_indx,attention_mask=None):
