@@ -84,6 +84,153 @@ class CCA_net22(BertPreTrainedModel):
 
         return logits,hidden,hidden1
 
+def Mylogit11(hidden_states_new,node_indx,attention_mask=None):
+    b, n, _, d = hidden_states_new.size()
+    # col_states1 : ( b, n, n, n, d) 
+    """
+    首先在第三个维度位置增加一个维度，然后把第三个维度的数据复制了n个。
+    """
+    col_states1 = hidden_states_new.unsqueeze(2).expand(b, n, n, n, d)  
+    # row_states : (b, n, n, d)
+    row_states = hidden_states_new.permute(0, 2, 1, 3).contiguous()
+    # row_states1 : (b, n, n, n, d)
+     """
+    首先把第二个维度和第三个维度互换，虽然第二个维度和第三个维度大小相等，但是原先数据分布发生了变化。
+    """
+    row_states1 = row_states.unsqueeze(1).expand(b, n, n, n, d)     
+    # key_states: (?,n*2,d)
+    key_states = torch.cat((col_states1[node_indx], row_states1[node_indx]), dim=-2)  
+
+    if attention_mask is not None:
+        
+        # (b,n,n) -> (b,n,1,n) -> (b,n,n,n)
+        col_mask1 = attention_mask.unsqueeze(2).expand(b, n, n, n)  
+        # (b,n,n)
+        row_mask = attention_mask.permute(0, 2, 1).contiguous()
+        # (b,n,n) -> (b,n,n,n)
+        row_mask1 = row_mask.unsqueeze(1).expand(b, n, n, n)     
+        # (1,1,n,n) 
+        mask_self = 1 - torch.eye(n).to(attention_mask).unsqueeze(0).unsqueeze(1)  
+        # (b,n,n,n)
+        col_mask1 = col_mask1 * mask_self
+        
+        # (b,n,n,n*2)
+        attention_mask = torch.cat((col_mask1[node_indx], row_mask1[node_indx]), dim=-1)
+
+        attention_mask = (1.0 - attention_mask) * -10000.0  
+        # (b,1,n,n,n*2)
+        attention_mask = attention_mask.unsqueeze(1)  
+
+    return key_states,attention_mask
+
+class MyCCAttention(nn.Module):
+    def __init__(self, config,num_attention_heads):
+        super().__init__()
+        self.config = config
+        self.num_attention_heads = num_attention_heads
+        self.attention_head_size = int(config.hidden_size / self.num_attention_heads)
+
+        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.act_fn = nn.ReLU()
+
+        self.query = nn.Linear(config.hidden_size, config.hidden_size)
+        self.key = nn.Linear(config.hidden_size, config.hidden_size)
+        self.value = nn.Linear(config.hidden_size, config.hidden_size)
+
+        self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
+
+        
+        self.mid_output = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.Dropout(config.hidden_dropout_prob),
+        )
+
+        self.logit_function = {
+            0: logit111,
+            1: logit222,
+            2: logit333,
+            3: logit444,
+        }
+
+    def transpose_for_scores(self, x):
+        new_x_shape = x.size()[:-1] + (self.num_attention_heads, x.size(-1)//self.num_attention_heads)
+        x = x.view(*new_x_shape)  
+        if(len(list(x.size()))==4):
+            return x.permute(0, 2, 1, 3)
+        if(len(list(x.size()))==5):
+            return x.permute(0, 3, 1, 2, 4)
+        if (len(list(x.size())) == 3):
+            return x
+
+    def forward(self, Input,hidden_states,attention_mask):
+        '''
+        :param Input: [b,e_n,e_n,768] & 512
+        :param hidden_states: [b,e_n,e_n,768] & 512
+        :param attention_mask: [b,e_n,e_n]
+        :param output_attentions: 
+        :return:
+        '''
+        node_indx = (attention_mask >0)  
+        
+        # new_hidden_states, new_hidden_states_Q ：(?, hidden_size)
+        new_hidden_states = Input[node_indx]
+        new_hidden_states_Q = hidden_states[node_indx]
+
+        # q, k, v : (?, num_attention_heads, hidden_size//num_attention_heads)
+        key_layer = self.transpose_for_scores(self.key(new_hidden_states))  
+        value_layer = self.transpose_for_scores(self.value(new_hidden_states))  
+        query_layer = self.transpose_for_scores(self.query(new_hidden_states_Q))  
+
+        # new_hidden_states : (b,e_n,e_n,hidden_size//num_attention_heads)
+        new_hidden_states = torch.zeros(hidden_states.size()[:-1]+(key_layer.size(-1),)).to(key_layer)
+        
+        key_layers, value_layers, attention_masks = [], [], []
+        for i in range(self.num_attention_heads):
+            j=i%4
+            # (?,hidden_size//num_attention_heads) = (?, hidden_size//num_attention_heads). ps:new_hidden_states已创新创建
+            new_hidden_states[node_indx] = key_layer[:, i]  
+            
+            # (?,n*2,d), (b,1,n,n,n*2)
+            key_state, attention_mask1 = self.logit_function[j](new_hidden_states, node_indx, attention_mask)
+            key_state = torch.cat((key_layer[:, i].unsqueeze(1),key_state),dim=1) 
+
+            new_hidden_states[node_indx] = value_layer[:, i]    
+            value_state, _ = self.logit_function[j](new_hidden_states, node_indx)
+            value_state = torch.cat((value_layer[:, i].unsqueeze(1), value_state), dim=1)  
+
+            L = attention_mask1.size(0)
+            attention_mask2 = torch.ones((L,1,1)).to(attention_mask1) 
+            attention_mask1 = torch.cat((attention_mask2, attention_mask1), dim=-1)  
+
+            key_layers.append(key_state)
+            value_layers.append(value_state)
+            attention_masks.append(attention_mask1)
+
+        # k,v,attention_mask: (?, num_attention_heads, n+1, hidden_size//num_attention_heads)
+        key_layer = torch.stack(key_layers, dim=1)  
+        value_layer = torch.stack(value_layers, dim=1)  
+        attention_mask = torch.cat(attention_masks, dim=1)  
+
+        # (?, num_attention_heads, 1, hidden_size//num_attention_heads)
+        query_layer = query_layer.unsqueeze(2) 
+        # (?, num_attention_heads, 1, n+1) = (?, num_attention_heads, 1, hidden_size//num_attention_heads) @ (?, num_attention_heads, hidden_size//num_attention_heads, n+1)
+        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+        attention_scores = attention_scores / math.sqrt(key_layer.size(-1))
+
+        if attention_mask is not None:
+            attention_scores = attention_scores + attention_mask.unsqueeze(2)
+
+        attention_probs = nn.Softmax(dim=-1)(attention_scores)
+        attention_probs = self.dropout(attention_probs)
+
+        # (?, num_attention_heads, 1, n+1) * (?, num_attention_heads, n+1, hidden_size//num_attention_heads)
+        context_layer = torch.matmul(attention_probs, value_layer).squeeze(-2)
+        new_context_layer_shape = context_layer.size()[:-2] + (context_layer.size(-1)*context_layer.size(-2),)
+        context_layer = context_layer.view(*new_context_layer_shape)
+        context_layer = self.mid_output(context_layer)
+
+        return context_layer
+
 def logit11(hidden_states_new,node_indx,attention_mask=None):
     b, n, _, d = hidden_states_new.size()
     col_states1 = hidden_states_new.unsqueeze(2).expand(b, n, n, n, d)  
